@@ -6,19 +6,29 @@
 #include <mmdeviceapi.h>
 #include <audiopolicy.h>
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cwctype>
 #include <string>
 #include <vector>
 
 enum { HK_UP = 1, HK_DOWN };
-enum { ID_EXIT = 1, ID_KEY_UP = 101, ID_KEY_DOWN, ID_STEP };
+enum { ID_EXIT = 1, ID_KEY_UP = 101, ID_KEY_DOWN, ID_STEP, ID_SCROLL };
 constexpr UINT WM_TRAY = WM_APP + 1;
-constexpr UINT_PTR OSD_TIMER = 1;
+constexpr UINT WM_WHEEL = WM_APP + 2;
+constexpr UINT_PTR OSD_TIMER = 1, HOLD_TIMER = 2;
 
 // Defaults as hotkey-control values (flags in the high byte): Ctrl+Alt+Up / Ctrl+Alt+Down.
 constexpr int DEFAULT_UP = MAKEWORD(VK_UP, HOTKEYF_CONTROL | HOTKEYF_ALT | HOTKEYF_EXT);
 constexpr int DEFAULT_DOWN = MAKEWORD(VK_DOWN, HOTKEYF_CONTROL | HOTKEYF_ALT | HOTKEYF_EXT);
+
+static const struct { const wchar_t* name; UINT mods; } SCROLL_OPTIONS[] = {
+    {L"Off", 0},
+    {L"Ctrl+Alt", MOD_CONTROL | MOD_ALT},
+    {L"Alt", MOD_ALT},
+    {L"Ctrl+Shift", MOD_CONTROL | MOD_SHIFT},
+    {L"Alt+Shift", MOD_ALT | MOD_SHIFT},
+};
 
 static std::wstring g_ini;
 static int g_dpi = 96;
@@ -27,6 +37,17 @@ static HWND g_main, g_osd, g_popup;
 static NOTIFYICONDATAW g_tray = {};
 static UINT g_taskbarCreated;
 static DWORD g_popupHiddenAt;
+
+static int g_keyUp, g_keyDown, g_stepPercent;
+static std::atomic<UINT> g_scrollMods;
+static DWORD g_hookThreadId;
+static int g_wheelRemainder;
+static int g_holdDir, g_holdKey;
+static DWORD g_holdStart;
+
+// Sessions of the app being adjusted, kept until the indicator hides so repeated presses are fast.
+static DWORD g_cachedPid;
+static std::vector<ISimpleAudioVolume*> g_cached;
 
 static std::wstring g_osdName;
 static float g_osdLevel;  // negative means the app has no audio session
@@ -97,6 +118,12 @@ static std::vector<ISimpleAudioVolume*> sessionsFor(DWORD pid, const std::wstrin
     return out;
 }
 
+static void clearCache() {
+    for (auto* v : g_cached) v->Release();
+    g_cached.clear();
+    g_cachedPid = 0;
+}
+
 static void showOsd() {
     MONITORINFO mi = {sizeof(mi)};
     GetMonitorInfoW(MonitorFromWindow(GetForegroundWindow(), MONITOR_DEFAULTTONEAREST), &mi);
@@ -107,32 +134,87 @@ static void showOsd() {
     int y = mi.rcWork.bottom - h - px(80);
     SetWindowPos(g_osd, HWND_TOPMOST, x, y, 0, 0, SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
     InvalidateRect(g_osd, nullptr, FALSE);
+    UpdateWindow(g_osd);
     SetTimer(g_osd, OSD_TIMER, 1200, nullptr);
 }
 
 static void adjustFocused(float delta) {
     DWORD pid = 0;
     GetWindowThreadProcessId(GetForegroundWindow(), &pid);
-    std::wstring exe = exeName(pid);
-    if (exe.empty()) return;
+    if (pid != g_cachedPid || g_cached.empty()) {
+        clearCache();
+        std::wstring exe = exeName(pid);
+        if (exe.empty()) return;
+        g_cachedPid = pid;
+        g_cached = sessionsFor(pid, exe);
+        g_osdName = exe.substr(0, exe.find_last_of(L'.'));
+    }
 
-    g_osdName = exe.substr(0, exe.find_last_of(L'.'));
     g_osdLevel = -1;
-
-    auto volumes = sessionsFor(pid, exe);
-    if (!volumes.empty()) {
+    if (!g_cached.empty()) {
         // The first session is the reference so all of the app's sessions end up the same.
         float level = 0;
-        volumes[0]->GetMasterVolume(&level);
+        g_cached[0]->GetMasterVolume(&level);
         level = std::clamp(std::round((level + delta) * 100) / 100, 0.0f, 1.0f);
-        for (auto* v : volumes) {
+        for (auto* v : g_cached) {
             v->SetMasterVolume(level, nullptr);
             v->SetMute(FALSE, nullptr);
-            v->Release();
         }
         g_osdLevel = level;
     }
     showOsd();
+}
+
+static UINT heldMods() {
+    auto down = [](int vk) { return GetAsyncKeyState(vk) < 0; };
+    return (down(VK_CONTROL) ? MOD_CONTROL : 0) | (down(VK_MENU) ? MOD_ALT : 0) |
+           (down(VK_SHIFT) ? MOD_SHIFT : 0) | (down(VK_LWIN) || down(VK_RWIN) ? MOD_WIN : 0);
+}
+
+// Runs on its own thread, so slow audio calls on the main thread never stall the mouse.
+static LRESULT CALLBACK mouseHook(int code, WPARAM wp, LPARAM lp) {
+    UINT mods = g_scrollMods;
+    if (code == HC_ACTION && wp == WM_MOUSEWHEEL && mods && heldMods() == mods) {
+        auto* info = (MSLLHOOKSTRUCT*)lp;
+        PostMessageW(g_main, WM_WHEEL, (WPARAM)(short)HIWORD(info->mouseData), 0);
+
+        // Releasing Alt on its own opens the focused app's menu bar; a dummy key press prevents that.
+        if (mods & MOD_ALT) {
+            INPUT in[2] = {};
+            in[0].type = in[1].type = INPUT_KEYBOARD;
+            in[0].ki.wVk = in[1].ki.wVk = 0xE8;
+            in[1].ki.dwFlags = KEYEVENTF_KEYUP;
+            SendInput(2, in, sizeof(INPUT));
+        }
+        return 1;
+    }
+    return CallNextHookEx(nullptr, code, wp, lp);
+}
+
+static DWORD WINAPI hookThread(void*) {
+    HHOOK hook = SetWindowsHookExW(WH_MOUSE_LL, mouseHook, GetModuleHandleW(nullptr), 0);
+    MSG msg;
+    while (GetMessageW(&msg, nullptr, 0, 0) > 0) {}
+    UnhookWindowsHookEx(hook);
+    return 0;
+}
+
+// The hook only exists while scroll is enabled, so it costs nothing when off.
+static void updateScrollHook() {
+    if (g_scrollMods && !g_hookThreadId) {
+        CloseHandle(CreateThread(nullptr, 0, hookThread, nullptr, 0, &g_hookThreadId));
+    } else if (!g_scrollMods && g_hookThreadId) {
+        PostThreadMessageW(g_hookThreadId, WM_QUIT, 0, 0);
+        g_hookThreadId = 0;
+    }
+}
+
+// Converts wheel movement into volume steps. Touchpads send small deltas, so the leftover is kept.
+static int notches(WPARAM wp) {
+    g_wheelRemainder += (int)(INT_PTR)wp;
+    int n = g_wheelRemainder / WHEEL_DELTA;
+    g_wheelRemainder -= n * WHEEL_DELTA;
+    return n;
 }
 
 static int readInt(const wchar_t* key, int fallback) {
@@ -143,7 +225,12 @@ static void writeInt(const wchar_t* key, int value) {
     WritePrivateProfileStringW(L"settings", key, std::to_wstring(value).c_str(), g_ini.c_str());
 }
 
-static float step() { return std::clamp(readInt(L"step", 5), 1, 25) / 100.0f; }
+static void loadSettings() {
+    g_keyUp = readInt(L"volume_up", DEFAULT_UP);
+    g_keyDown = readInt(L"volume_down", DEFAULT_DOWN);
+    g_stepPercent = std::clamp(readInt(L"step", 5), 1, 25);
+    g_scrollMods = readInt(L"scroll_mods", MOD_CONTROL | MOD_ALT);
+}
 
 // Hotkey-control flags and RegisterHotKey modifiers use different bits.
 static UINT toMods(int hotkey) {
@@ -153,10 +240,11 @@ static UINT toMods(int hotkey) {
 }
 
 static void registerHotkeys() {
-    int up = readInt(L"volume_up", DEFAULT_UP), down = readInt(L"volume_down", DEFAULT_DOWN);
     bool ok = true;
-    if (LOBYTE(up)) ok &= RegisterHotKey(g_main, HK_UP, toMods(up), LOBYTE(up)) != 0;
-    if (LOBYTE(down)) ok &= RegisterHotKey(g_main, HK_DOWN, toMods(down), LOBYTE(down)) != 0;
+    // Key repeat is ignored; holding is handled by the hold timer instead.
+    if (LOBYTE(g_keyUp)) ok &= RegisterHotKey(g_main, HK_UP, toMods(g_keyUp) | MOD_NOREPEAT, LOBYTE(g_keyUp)) != 0;
+    if (LOBYTE(g_keyDown))
+        ok &= RegisterHotKey(g_main, HK_DOWN, toMods(g_keyDown) | MOD_NOREPEAT, LOBYTE(g_keyDown)) != 0;
     if (!ok)
         MessageBoxW(nullptr, L"A hotkey is already used by another app. Pick a different one from the tray icon.",
                     L"win-volume", MB_ICONWARNING);
@@ -170,9 +258,13 @@ static void unregisterHotkeys() {
 static void openPopup() {
     // Without this, pressing the current hotkeys in the picker would fire them instead of recording.
     unregisterHotkeys();
-    SendDlgItemMessageW(g_popup, ID_KEY_UP, HKM_SETHOTKEY, readInt(L"volume_up", DEFAULT_UP), 0);
-    SendDlgItemMessageW(g_popup, ID_KEY_DOWN, HKM_SETHOTKEY, readInt(L"volume_down", DEFAULT_DOWN), 0);
-    SetDlgItemInt(g_popup, ID_STEP, readInt(L"step", 5), FALSE);
+    SendDlgItemMessageW(g_popup, ID_KEY_UP, HKM_SETHOTKEY, g_keyUp, 0);
+    SendDlgItemMessageW(g_popup, ID_KEY_DOWN, HKM_SETHOTKEY, g_keyDown, 0);
+    SetDlgItemInt(g_popup, ID_STEP, g_stepPercent, FALSE);
+    int scrollIndex = 0;
+    for (int i = 0; i < (int)ARRAYSIZE(SCROLL_OPTIONS); i++)
+        if (SCROLL_OPTIONS[i].mods == g_scrollMods) scrollIndex = i;
+    SendDlgItemMessageW(g_popup, ID_SCROLL, CB_SETCURSEL, scrollIndex, 0);
 
     // Bottom-right of the work area, next to the tray.
     MONITORINFO mi = {sizeof(mi)};
@@ -189,12 +281,17 @@ static void openPopup() {
 
 // Settings are saved whenever the popup loses focus.
 static void closePopup() {
+    int scrollIndex = (int)SendDlgItemMessageW(g_popup, ID_SCROLL, CB_GETCURSEL, 0, 0);
     writeInt(L"volume_up", (int)SendDlgItemMessageW(g_popup, ID_KEY_UP, HKM_GETHOTKEY, 0, 0));
     writeInt(L"volume_down", (int)SendDlgItemMessageW(g_popup, ID_KEY_DOWN, HKM_GETHOTKEY, 0, 0));
     writeInt(L"step", std::clamp((int)GetDlgItemInt(g_popup, ID_STEP, nullptr, FALSE), 1, 25));
+    writeInt(L"scroll_mods", SCROLL_OPTIONS[std::max(scrollIndex, 0)].mods);
     ShowWindow(g_popup, SW_HIDE);
     g_popupHiddenAt = GetTickCount();
+
+    loadSettings();
     registerHotkeys();
+    updateScrollHook();
 }
 
 static LRESULT CALLBACK osdProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
@@ -202,6 +299,7 @@ static LRESULT CALLBACK osdProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_TIMER:
         KillTimer(hwnd, OSD_TIMER);
         ShowWindow(hwnd, SW_HIDE);
+        clearCache();
         return 0;
     case WM_ERASEBKGND:
         return 1;
@@ -253,8 +351,31 @@ static LRESULT CALLBACK popupProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 static LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
     case WM_HOTKEY:
-        adjustFocused(wp == HK_UP ? step() : -step());
+        g_holdDir = wp == HK_UP ? 1 : -1;
+        g_holdKey = LOBYTE(wp == HK_UP ? g_keyUp : g_keyDown);
+        g_holdStart = GetTickCount();
+        adjustFocused(g_holdDir * g_stepPercent / 100.0f);
+        SetTimer(hwnd, HOLD_TIMER, 50, nullptr);
         return 0;
+    case WM_TIMER: {
+        DWORD held = GetTickCount() - g_holdStart;
+        if (GetAsyncKeyState(g_holdKey) >= 0) {
+            KillTimer(hwnd, HOLD_TIMER);
+        } else if (held > 300) {
+            // Starts at 1% per tick and speeds up to 3% the longer the key is held.
+            int percent = std::min<int>(1 + (held - 300) / 600, 3);
+            adjustFocused(g_holdDir * percent / 100.0f);
+        }
+        return 0;
+    }
+    case WM_WHEEL: {
+        // Merge queued wheel messages so fast scrolling can't build a backlog.
+        int n = notches(wp);
+        MSG m;
+        while (PeekMessageW(&m, hwnd, WM_WHEEL, WM_WHEEL, PM_REMOVE)) n += notches(m.wParam);
+        if (n) adjustFocused(n * g_stepPercent / 100.0f);
+        return 0;
+    }
     case WM_TRAY:
         // Clicking the icon while the popup is open closes it first; don't reopen it right away.
         if (lp == WM_LBUTTONUP && GetTickCount() - g_popupHiddenAt > 300) openPopup();
@@ -293,25 +414,30 @@ static HWND makeWindow(const wchar_t* cls, WNDPROC proc, DWORD exStyle, DWORD st
 }
 
 static void buildPopup(HINSTANCE inst) {
-    int w = px(250), rowH = px(32), pad = px(12);
-    g_popup = makeWindow(L"win-volume-popup", popupProc, WS_EX_TOOLWINDOW | WS_EX_TOPMOST, WS_POPUP | WS_BORDER,
-                         w, pad * 2 + rowH * 3, inst);
-
     const struct { const wchar_t* label; const wchar_t* cls; int id; DWORD style; } rows[] = {
         {L"Volume up", HOTKEY_CLASSW, ID_KEY_UP, 0},
         {L"Volume down", HOTKEY_CLASSW, ID_KEY_DOWN, 0},
         {L"Step (%)", L"EDIT", ID_STEP, ES_NUMBER | WS_BORDER},
+        {L"Scroll wheel", L"COMBOBOX", ID_SCROLL, CBS_DROPDOWNLIST},
     };
-    for (int i = 0; i < 3; i++) {
+    int w = px(250), rowH = px(32), pad = px(12);
+    g_popup = makeWindow(L"win-volume-popup", popupProc, WS_EX_TOOLWINDOW | WS_EX_TOPMOST, WS_POPUP | WS_BORDER,
+                         w, pad * 2 + rowH * ARRAYSIZE(rows), inst);
+
+    for (int i = 0; i < (int)ARRAYSIZE(rows); i++) {
         int y = pad + rowH * i;
+        // A combo box's height includes its dropdown list.
+        int h = rows[i].id == ID_SCROLL ? px(200) : px(24);
         HWND label = CreateWindowW(L"STATIC", rows[i].label, WS_CHILD | WS_VISIBLE | SS_CENTERIMAGE,
                                    pad, y, px(90), px(24), g_popup, nullptr, inst, nullptr);
         HWND input = CreateWindowW(rows[i].cls, L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP | rows[i].style,
-                                   pad + px(94), y, w - pad * 2 - px(96), px(24), g_popup,
+                                   pad + px(94), y, w - pad * 2 - px(96), h, g_popup,
                                    (HMENU)(INT_PTR)rows[i].id, inst, nullptr);
         SendMessageW(label, WM_SETFONT, (WPARAM)g_font, TRUE);
         SendMessageW(input, WM_SETFONT, (WPARAM)g_font, TRUE);
     }
+    for (auto& option : SCROLL_OPTIONS)
+        SendDlgItemMessageW(g_popup, ID_SCROLL, CB_ADDSTRING, 0, (LPARAM)option.name);
 }
 
 int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int) {
@@ -356,7 +482,9 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int) {
     lstrcpynW(g_tray.szTip, L"win-volume", ARRAYSIZE(g_tray.szTip));
     Shell_NotifyIconW(NIM_ADD, &g_tray);
 
+    loadSettings();
     registerHotkeys();
+    updateScrollHook();
 
     MSG msg;
     while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
@@ -367,6 +495,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int) {
         }
     }
 
+    clearCache();
     CoUninitialize();
     return 0;
 }
