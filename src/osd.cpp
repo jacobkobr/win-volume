@@ -2,6 +2,7 @@
 #include "ui.h"
 
 #include <windows.h>
+#include <dwmapi.h>
 #include <cmath>
 
 constexpr UINT_PTR HIDE_TIMER = 1;
@@ -28,7 +29,8 @@ static LRESULT CALLBACK osdProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             FillRect(dc, &r, b);
             DeleteObject(b);
         };
-        fill(rc, RGB(32, 32, 32));
+        bool dark = systemDark();
+        fill(rc, dark ? RGB(43, 43, 43) : RGB(249, 249, 249));
 
         int pad = px(14);
         RECT name = {pad, pad, rc.right - pad - px(64), rc.bottom};
@@ -36,13 +38,13 @@ static LRESULT CALLBACK osdProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         std::wstring text = g_level < 0 ? L"No audio" : std::to_wstring(std::lround(g_level * 100)) + L"%";
         SelectObject(dc, g_font);
         SetBkMode(dc, TRANSPARENT);
-        SetTextColor(dc, RGB(240, 240, 240));
+        SetTextColor(dc, dark ? RGB(240, 240, 240) : RGB(26, 26, 26));
         DrawTextW(dc, g_name.c_str(), -1, &name, DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
-        SetTextColor(dc, RGB(170, 170, 170));
+        SetTextColor(dc, dark ? RGB(190, 190, 190) : RGB(90, 90, 90));
         DrawTextW(dc, text.c_str(), -1, &value, DT_SINGLELINE | DT_RIGHT);
 
         RECT track = {pad, rc.bottom - pad - px(4), rc.right - pad, rc.bottom - pad};
-        fill(track, RGB(70, 70, 70));
+        fill(track, dark ? RGB(70, 70, 70) : RGB(210, 210, 210));
         if (g_level > 0) {
             RECT bar = track;
             bar.right = track.left + std::lround((track.right - track.left) * g_level);
@@ -61,21 +63,25 @@ void createOsd() {
     g_osd = makeWindow(L"win-volume-osd", osdProc,
                        WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
                        WS_POPUP, w, h);
-    SetLayeredWindowAttributes(g_osd, 0, 235, LWA_ALPHA);
-    SetWindowRgn(g_osd, CreateRoundRectRgn(0, 0, w + 1, h + 1, px(12), px(12)), FALSE);
+    SetLayeredWindowAttributes(g_osd, 0, 255, LWA_ALPHA);
+    // Same rounded corners and system border as the settings popup.
+    DWM_WINDOW_CORNER_PREFERENCE corners = DWMWCP_ROUND;
+    DwmSetWindowAttribute(g_osd, DWMWA_WINDOW_CORNER_PREFERENCE, &corners, sizeof(corners));
 }
 
 void showOsd(const std::wstring& appName, float level) {
     g_name = appName;
     g_level = level;
 
+    // Bottom-right of the work area, above the taskbar, on the focused app's monitor.
     MONITORINFO mi = {sizeof(mi)};
     GetMonitorInfoW(MonitorFromWindow(GetForegroundWindow(), MONITOR_DEFAULTTONEAREST), &mi);
     RECT wr;
     GetWindowRect(g_osd, &wr);
-    int w = wr.right - wr.left, h = wr.bottom - wr.top;
-    int x = (mi.rcWork.left + mi.rcWork.right - w) / 2;
-    int y = mi.rcWork.bottom - h - px(80);
+    int x = mi.rcWork.right - (wr.right - wr.left) - px(12);
+    int y = mi.rcWork.bottom - (wr.bottom - wr.top) - px(12);
+    BOOL dark = systemDark();
+    DwmSetWindowAttribute(g_osd, DWMWA_USE_IMMERSIVE_DARK_MODE, &dark, sizeof(dark));
     SetWindowPos(g_osd, HWND_TOPMOST, x, y, 0, 0, SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
     InvalidateRect(g_osd, nullptr, FALSE);
     UpdateWindow(g_osd);
