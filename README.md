@@ -2,8 +2,9 @@
 
 Hotkeys that change the volume of the app in the focused window, with a small on-screen indicator.
 
-- Default hotkeys: `Ctrl+Alt+Up` / `Ctrl+Alt+Down`, 5% per press
-- Left-click the tray icon to change hotkeys and step size, right-click to exit
+- Default hotkeys: `Ctrl+Alt+Up` / `Ctrl+Alt+Down`, 5% per press, speeds up when held
+- `Ctrl+Alt` + scroll wheel also works (modifier can be changed or turned off)
+- Left-click the tray icon to change settings, right-click to exit
 - Settings are saved to `win-volume.ini` next to the exe
 
 ## Build
