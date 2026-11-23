@@ -20,15 +20,3 @@ Or with MinGW directly:
 windres res/app.rc -O coff -o build/app.o
 g++ -std=c++17 -O2 -DUNICODE -D_UNICODE -DNOMINMAX -mwindows -static -s src/*.cpp build/app.o -o build/win-volume.exe -lole32 -lshell32 -luser32 -lgdi32 -lcomctl32 -ldwmapi -luxtheme -ladvapi32
 ```
-
-## Layout
-
-- `main.cpp` – tray icon, hotkeys, hold/scroll handling
-- `audio.cpp` – finds the focused app's audio sessions and sets their volume
-- `osd.cpp` – on-screen volume indicator
-- `popup.cpp` – settings flyout from the tray icon
-- `scroll.cpp` – mouse hook for modifier + scroll wheel
-- `settings.cpp` – loads/saves `win-volume.ini`
-- `ui.cpp` – DPI, fonts, dark mode helpers
-
-To start it with Windows, put a shortcut to the exe in `shell:startup`.
