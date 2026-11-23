@@ -26,7 +26,10 @@ static DWORD g_holdStart;
 static void adjust(float delta) {
     std::wstring name;
     float level;
-    if (adjustFocusedApp(delta, name, level)) showOsd(name, level);
+    if (!planVolumeChange(delta, name, level)) return;
+    // Indicator first: apps with many audio sessions (like Discord) take a moment to apply.
+    showOsd(name, level);
+    applyVolumeChange();
 }
 
 // Hotkey-control flags and RegisterHotKey modifiers use different bits.
