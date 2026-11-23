@@ -113,6 +113,14 @@ static LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_COMMAND:
         if (LOWORD(wp) == ID_EXIT) DestroyWindow(hwnd);
         return 0;
+    case WM_SETTINGCHANGE:
+        // Light/dark switched, so recolor the tray icon.
+        if (lp && lstrcmpW((LPCWSTR)lp, L"ImmersiveColorSet") == 0) {
+            DestroyIcon(g_tray.hIcon);
+            g_tray.hIcon = makeTrayIcon();
+            Shell_NotifyIconW(NIM_MODIFY, &g_tray);
+        }
+        return 0;
     case WM_DESTROY:
         Shell_NotifyIconW(NIM_DELETE, &g_tray);
         PostQuitMessage(0);
@@ -142,7 +150,7 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
     g_tray.uID = 1;
     g_tray.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
     g_tray.uCallbackMessage = WM_TRAY;
-    g_tray.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
+    g_tray.hIcon = makeTrayIcon();
     lstrcpynW(g_tray.szTip, L"win-volume", ARRAYSIZE(g_tray.szTip));
     Shell_NotifyIconW(NIM_ADD, &g_tray);
 
