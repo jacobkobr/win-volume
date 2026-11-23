@@ -17,6 +17,7 @@ template <class T> struct Com {
 };
 
 static DWORD g_cachedPid, g_lastUse;
+static float g_level;  // tracked here during a burst so each step doesn't have to ask Windows
 static std::wstring g_cachedName;
 static std::vector<ISimpleAudioVolume*> g_cached;
 
@@ -82,7 +83,7 @@ void releaseAudio() {
     g_cachedPid = 0;
 }
 
-bool adjustFocusedApp(float delta, std::wstring& appName, float& level) {
+bool planVolumeChange(float delta, std::wstring& appName, float& level) {
     DWORD pid = 0;
     GetWindowThreadProcessId(GetForegroundWindow(), &pid);
 
@@ -95,18 +96,22 @@ bool adjustFocusedApp(float delta, std::wstring& appName, float& level) {
         g_cachedPid = pid;
         g_cachedName = exe.substr(0, exe.find_last_of(L'.'));
         g_cached = sessionsFor(pid, exe);
+        // The first session is the reference so all of the app's sessions end up the same.
+        if (!g_cached.empty()) g_cached[0]->GetMasterVolume(&g_level);
     }
     g_lastUse = GetTickCount();
     appName = g_cachedName;
     level = -1;
     if (g_cached.empty()) return true;
 
-    // The first session is the reference so all of the app's sessions end up the same.
-    g_cached[0]->GetMasterVolume(&level);
-    level = std::clamp(std::round((level + delta) * 100) / 100, 0.0f, 1.0f);
+    g_level = std::clamp(std::round((g_level + delta) * 100) / 100, 0.0f, 1.0f);
+    level = g_level;
+    return true;
+}
+
+void applyVolumeChange() {
     for (auto* v : g_cached) {
-        v->SetMasterVolume(level, nullptr);
+        v->SetMasterVolume(g_level, nullptr);
         v->SetMute(FALSE, nullptr);
     }
-    return true;
 }
