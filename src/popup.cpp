@@ -8,7 +8,7 @@
 #include <algorithm>
 #include <string>
 
-enum { ID_TITLE = 100, ID_KEY_UP, ID_KEY_DOWN, ID_STEP, ID_SCROLL };
+enum { ID_TITLE = 100, ID_KEY_UP, ID_KEY_DOWN, ID_STEP, ID_SCROLL, ID_STARTUP };
 
 static const struct { const wchar_t* name; UINT mods; } SCROLL_OPTIONS[] = {
     {L"Off", 0},
@@ -86,6 +86,7 @@ static void closePopup() {
     g_settings.keyDown = keyBoxValue(ID_KEY_DOWN);
     g_settings.stepPercent = std::clamp((int)GetDlgItemInt(g_popup, ID_STEP, nullptr, FALSE), 1, 25);
     g_settings.scrollMods = SCROLL_OPTIONS[std::max(scroll, 0)].mods;
+    g_settings.startup = IsDlgButtonChecked(g_popup, ID_STARTUP);
     saveSettings();
 
     ShowWindow(g_popup, SW_HIDE);
@@ -126,6 +127,7 @@ void createPopup(HWND notify, UINT closedMsg) {
         {L"Volume down", L"EDIT", ID_KEY_DOWN, ES_READONLY | WS_BORDER},
         {L"Step (%)", L"EDIT", ID_STEP, ES_NUMBER | WS_BORDER},
         {L"Scroll wheel", L"COMBOBOX", ID_SCROLL, CBS_DROPDOWNLIST},
+        {L"Run at startup", L"BUTTON", ID_STARTUP, BS_AUTOCHECKBOX},
     };
     int n = ARRAYSIZE(rows);
     int w = px(290), pad = px(16), rowH = px(34), fieldH = px(24), top = pad + px(34);
@@ -169,6 +171,7 @@ bool openPopup() {
     for (int i = 0; i < (int)ARRAYSIZE(SCROLL_OPTIONS); i++)
         if (SCROLL_OPTIONS[i].mods == g_settings.scrollMods) scroll = i;
     SendDlgItemMessageW(g_popup, ID_SCROLL, CB_SETCURSEL, scroll, 0);
+    CheckDlgButton(g_popup, ID_STARTUP, g_settings.startup);
 
     // Bottom-right of the work area, above the taskbar.
     MONITORINFO mi = {sizeof(mi)};

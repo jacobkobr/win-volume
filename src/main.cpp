@@ -109,6 +109,7 @@ static LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_POPUP_CLOSED:
         registerHotkeys();
         setScrollHook(g_settings.scrollMods, hwnd, WM_WHEEL);
+        applyStartup();
         return 0;
     case WM_COMMAND:
         if (LOWORD(wp) == ID_EXIT) DestroyWindow(hwnd);
@@ -139,6 +140,7 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     initUi();
     loadSettings();
+    applyStartup();
 
     g_main = makeWindow(L"win-volume", mainProc, 0, 0, 0, 0);
     createOsd();
